@@ -1,0 +1,385 @@
+name: 'GitHub Release Manager'
+description: 'Professional GitHub release creation and asset management action with comprehensive workflow integration'
+
+inputs:
+  body:
+    description: 'Release description text'
+    required: false
+    default: ''
+  body_path:
+    description: 'Path to file containing release description'
+    required: false
+  name:
+    description: 'Release name. Defaults to tag name if not specified'
+    required: false
+  tag_name:
+    description: 'Git tag name. Defaults to github.ref_name'
+    required: false
+  draft:
+    description: 'Create release as draft'
+    required: false
+    default: 'false'
+  prerelease:
+    description: 'Mark release as prerelease'
+    required: false
+    default: 'false'
+  files:
+    description: 'Newline-delimited list of file paths or glob patterns to upload as release assets'
+    required: false
+  token:
+    description: 'GitHub token with contents write permission'
+    required: false
+    default: ${{ github.token }}
+  repository:
+    description: 'Target repository in owner/repo format. Defaults to current repository'
+    required: false
+  target_commitish:
+    description: 'Commitish value for tag creation. Defaults to default branch'
+    required: false
+  generate_release_notes:
+    description: 'Automatically generate release notes from commits and pull requests'
+    required: false
+    default: 'false'
+  make_latest:
+    description: 'Set this release as the latest release for the repository'
+    required: false
+    default: 'true'
+  overwrite_files:
+    description: 'Overwrite existing release assets with same name'
+    required: false
+    default: 'true'
+  fail_on_unmatched_files:
+    description: 'Fail the action if file patterns do not match any files'
+    required: false
+    default: 'false'
+
+outputs:
+  id:
+    description: 'Release ID'
+    value: ${{ steps.create-release.outputs.release_id }}
+  url:
+    description: 'Release HTML page URL'
+    value: ${{ steps.create-release.outputs.html_url }}
+  upload_url:
+    description: 'Release asset upload URL'
+    value: ${{ steps.create-release.outputs.upload_url }}
+  tag_name:
+    description: 'Git tag name used for the release'
+    value: ${{ steps.create-release.outputs.tag_name }}
+  assets:
+    description: 'JSON array of uploaded asset information'
+    value: ${{ steps.create-release.outputs.assets }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Node.js Runtime
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Execute Release Creation
+      id: create-release
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        INPUT_BODY: ${{ inputs.body }}
+        INPUT_BODY_PATH: ${{ inputs.body_path }}
+        INPUT_NAME: ${{ inputs.name }}
+        INPUT_TAG_NAME: ${{ inputs.tag_name }}
+        INPUT_DRAFT: ${{ inputs.draft }}
+        INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        INPUT_FILES: ${{ inputs.files }}
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+        INPUT_TARGET_COMMITISH: ${{ inputs.target_commitish }}
+        INPUT_GENERATE_RELEASE_NOTES: ${{ inputs.generate_release_notes }}
+        INPUT_MAKE_LATEST: ${{ inputs.make_latest }}
+        INPUT_OVERWRITE_FILES: ${{ inputs.overwrite_files }}
+        INPUT_FAIL_ON_UNMATCHED_FILES: ${{ inputs.fail_on_unmatched_files }}
+      run: |
+        cat > release_manager.js << 'EOF'
+        const { execSync } = require('child_process');
+        const fs = require('fs');
+        const path = require('path');
+
+        function executeApiRequest(method, url, headers = {}, data = null) {
+          let command = `curl -s -w "HTTPSTATUS:%{http_code}" -X ${method} "${url}"`;
+          
+          for (const [key, value] of Object.entries(headers)) {
+            command += ` -H "${key}: ${value}"`;
+          }
+          
+          if (data) {
+            const jsonPayload = JSON.stringify(data).replace(/'/g, "'\"'\"'");
+            command += ` -d '${jsonPayload}'`;
+          }
+          
+          try {
+            const result = execSync(command, { encoding: 'utf8' });
+            const parts = result.split('HTTPSTATUS:');
+            const responseBody = parts[0];
+            const statusCode = parseInt(parts[1]);
+            
+            if (statusCode >= 400) {
+              throw new Error(`HTTP ${statusCode}: ${responseBody}`);
+            }
+            
+            return responseBody.trim() ? JSON.parse(responseBody) : {};
+          } catch (error) {
+            throw new Error(`API request failed: ${error.message}`);
+          }
+        }
+
+        function uploadAsset(uploadUrl, filePath, token) {
+          const fileName = path.basename(filePath);
+          
+          if (!uploadUrl) {
+            throw new Error('Upload URL is not available');
+          }
+          
+          const cleanUrl = uploadUrl.replace(/\{\?.*\}/, '');
+          const finalUrl = `${cleanUrl}?name=${encodeURIComponent(fileName)}`;
+          
+          const command = `curl -s -w "HTTPSTATUS:%{http_code}" -X POST "${finalUrl}" \
+            -H "Authorization: token ${token}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"${filePath}"`;
+          
+          try {
+            const result = execSync(command, { encoding: 'utf8' });
+            const parts = result.split('HTTPSTATUS:');
+            const responseBody = parts[0];
+            const statusCode = parseInt(parts[1]);
+            
+            if (statusCode >= 400) {
+              throw new Error(`Upload failed with HTTP ${statusCode}: ${responseBody}`);
+            }
+            
+            return JSON.parse(responseBody);
+          } catch (error) {
+            throw new Error(`Asset upload failed: ${error.message}`);
+          }
+        }
+
+        function setActionOutput(name, value) {
+          const outputFile = process.env.GITHUB_OUTPUT;
+          if (outputFile) {
+            fs.appendFileSync(outputFile, `${name}=${value}\n`);
+          }
+        }
+
+        function writeWorkflowSummary(content) {
+          const summaryFile = process.env.GITHUB_STEP_SUMMARY;
+          if (summaryFile) {
+            fs.appendFileSync(summaryFile, content + '\n');
+          }
+        }
+
+        function formatBytes(bytes) {
+          if (bytes === 0) return '0 B';
+          const units = ['B', 'KB', 'MB', 'GB'];
+          const factor = 1024;
+          const unitIndex = Math.floor(Math.log(bytes) / Math.log(factor));
+          return (bytes / Math.pow(factor, unitIndex)).toFixed(2) + ' ' + units[unitIndex];
+        }
+
+        function findMatchingFiles(pattern) {
+          try {
+            const command = `find . -path "./${pattern}" -type f 2>/dev/null || true`;
+            const output = execSync(command, { encoding: 'utf8' });
+            return output.split('\n')
+              .filter(file => file.trim())
+              .map(file => file.replace(/^\.\//, ''))
+              .filter(file => fs.existsSync(file));
+          } catch (error) {
+            return [];
+          }
+        }
+
+        async function main() {
+          const uploadedAssets = [];
+          let releaseInfo = null;
+          
+          try {
+            const token = process.env.GITHUB_TOKEN;
+            const repository = process.env.INPUT_REPOSITORY || process.env.GITHUB_REPOSITORY;
+            const tagName = process.env.INPUT_TAG_NAME || process.env.GITHUB_REF_NAME || 'latest';
+            const releaseName = process.env.INPUT_NAME || tagName;
+            const isDraft = process.env.INPUT_DRAFT === 'true';
+            const isPrerelease = process.env.INPUT_PRERELEASE === 'true';
+            const targetCommitish = process.env.INPUT_TARGET_COMMITISH;
+            const generateReleaseNotes = process.env.INPUT_GENERATE_RELEASE_NOTES === 'true';
+            const makeLatest = process.env.INPUT_MAKE_LATEST !== 'false';
+            const failOnUnmatched = process.env.INPUT_FAIL_ON_UNMATCHED_FILES === 'true';
+
+            let releaseBody = process.env.INPUT_BODY || '';
+            if (process.env.INPUT_BODY_PATH && fs.existsSync(process.env.INPUT_BODY_PATH)) {
+              releaseBody = fs.readFileSync(process.env.INPUT_BODY_PATH, 'utf8');
+            }
+
+            console.log(`Processing release for repository: ${repository}`);
+            console.log(`Target tag: ${tagName}`);
+
+            const apiHeaders = {
+              'Authorization': `token ${token}`,
+              'Accept': 'application/vnd.github.v3+json',
+              'User-Agent': 'github-release-manager'
+            };
+
+            let operationType = 'Created';
+            
+            try {
+              const checkUrl = `https://api.github.com/repos/${repository}/releases/tags/${tagName}`;
+              releaseInfo = executeApiRequest('GET', checkUrl, apiHeaders);
+              
+              console.log(`Updating existing release: ${releaseInfo.id}`);
+              operationType = 'Updated';
+              
+              const updatePayload = {
+                name: releaseName,
+                body: releaseBody,
+                draft: isDraft,
+                prerelease: isPrerelease
+              };
+
+              if (makeLatest) {
+                updatePayload.make_latest = 'true';
+              }
+
+              const updateUrl = `https://api.github.com/repos/${repository}/releases/${releaseInfo.id}`;
+              releaseInfo = executeApiRequest('PATCH', updateUrl, apiHeaders, updatePayload);
+              
+            } catch (error) {
+              console.log('Creating new release...');
+              
+              const createPayload = {
+                tag_name: tagName,
+                name: releaseName,
+                body: releaseBody,
+                draft: isDraft,
+                prerelease: isPrerelease,
+                generate_release_notes: generateReleaseNotes
+              };
+
+              if (targetCommitish) {
+                createPayload.target_commitish = targetCommitish;
+              }
+
+              if (makeLatest) {
+                createPayload.make_latest = 'true';
+              }
+
+              const createUrl = `https://api.github.com/repos/${repository}/releases`;
+              releaseInfo = executeApiRequest('POST', createUrl, apiHeaders, createPayload);
+            }
+
+            if (!releaseInfo || !releaseInfo.id) {
+              throw new Error('Failed to create or update release');
+            }
+
+            console.log(`Release ${operationType.toLowerCase()} successfully: ${releaseInfo.html_url}`);
+
+            const filePatterns = process.env.INPUT_FILES;
+            if (filePatterns && filePatterns.trim()) {
+              console.log('Processing asset uploads...');
+              const patterns = filePatterns.split('\n').filter(p => p.trim());
+              let hasUnmatchedPatterns = false;
+              
+              for (const pattern of patterns) {
+                const trimmedPattern = pattern.trim();
+                if (!trimmedPattern) continue;
+
+                console.log(`Searching for files matching: ${trimmedPattern}`);
+                const matchedFiles = findMatchingFiles(trimmedPattern);
+
+                if (matchedFiles.length === 0) {
+                  console.log(`No files found for pattern: ${trimmedPattern}`);
+                  hasUnmatchedPatterns = true;
+                  continue;
+                }
+
+                for (const filePath of matchedFiles) {
+                  try {
+                    console.log(`Uploading asset: ${filePath}`);
+                    const uploadResult = uploadAsset(releaseInfo.upload_url, filePath, token);
+                    
+                    console.log(`Successfully uploaded: ${uploadResult.name} (${formatBytes(uploadResult.size)})`);
+                    uploadedAssets.push({
+                      name: uploadResult.name,
+                      size: uploadResult.size,
+                      download_url: uploadResult.browser_download_url
+                    });
+                  } catch (uploadError) {
+                    console.error(`Failed to upload ${filePath}: ${uploadError.message}`);
+                  }
+                }
+              }
+
+              if (hasUnmatchedPatterns && failOnUnmatched) {
+                throw new Error('Some file patterns did not match any files');
+              }
+            }
+
+            setActionOutput('release_id', releaseInfo.id);
+            setActionOutput('html_url', releaseInfo.html_url);
+            setActionOutput('upload_url', releaseInfo.upload_url);
+            setActionOutput('tag_name', releaseInfo.tag_name);
+            setActionOutput('assets', JSON.stringify(uploadedAssets));
+
+            // Write minimal summary
+            let summary = `# GitHub Release ${operationType}\n\n`;
+            summary += `**Release Information:**\n\n`;
+            summary += `- **Repository:** ${repository}\n`;
+            summary += `- **Tag:** ${releaseInfo.tag_name}\n`;
+            summary += `- **Name:** ${releaseInfo.name}\n\n`;
+            
+            summary += `**Links:**\n\n`;
+            summary += `- [View Release](${releaseInfo.html_url})\n`;
+            summary += `- [Download ZIP](${releaseInfo.zipball_url})\n`;
+            summary += `- [Download TAR](${releaseInfo.tarball_url})\n\n`;
+
+            if (uploadedAssets.length > 0) {
+              summary += `**Uploaded Assets (${uploadedAssets.length}):**\n\n`;
+              summary += `| Asset | Size | Download |\n`;
+              summary += `|-------|------|---------|\n`;
+              
+              for (const asset of uploadedAssets) {
+                summary += `| ${asset.name} | ${formatBytes(asset.size)} | [Download](${asset.download_url}) |\n`;
+              }
+            }
+
+            writeWorkflowSummary(summary);
+
+            console.log(`Release process completed successfully`);
+
+          } catch (error) {
+            console.error(`Release process failed: ${error.message}`);
+            
+            let errorSummary = `# GitHub Release Failed\n\n`;
+            errorSummary += `**Error:** ${error.message}\n\n`;
+            
+            if (releaseInfo && releaseInfo.html_url) {
+              errorSummary += `**Partial Results:**\n`;
+              errorSummary += `- [Release URL](${releaseInfo.html_url})\n\n`;
+            }
+            
+            if (uploadedAssets.length > 0) {
+              errorSummary += `**Successfully Uploaded Assets:**\n`;
+              for (const asset of uploadedAssets) {
+                errorSummary += `- ${asset.name} (${formatBytes(asset.size)})\n`;
+              }
+            }
+            
+            writeWorkflowSummary(errorSummary);
+            process.exit(1);
+          }
+        }
+
+        main();
+        EOF
+
+        node release_manager.js
+
+branding:
+  color: 'green'
+  icon: 'tag'
