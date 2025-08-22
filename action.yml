@@ -1,4 +1,4 @@
-name: 'GitHub Release Manager'
+name: 'GH Release Manager'
 description: 'Professional GitHub release creation and asset management action with comprehensive workflow integration'
 
 inputs:
@@ -382,4 +382,5 @@ runs:
 
 branding:
   color: 'green'
+
   icon: 'tag'
